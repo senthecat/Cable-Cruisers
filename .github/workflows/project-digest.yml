@@ -10,8 +10,8 @@ name: Weekly Project Digest
 
 on:
   schedule:
-    # Mondays at 16:07 UTC = 8:07 AM Pacific standard time (9:07 AM after DST starts in March)
-    - cron: '7 16 * * 1'
+  - cron: '7 2 * * 1'   # Sunday 6:07 PM Pacific: full digest
+  - cron: '7 1 * * 4'   # Wednesday 5:07 PM Pacific: quick check
   workflow_dispatch: # lets you run it manually from the Actions tab
 
 permissions:
@@ -55,10 +55,11 @@ jobs:
                       pageInfo { hasNextPage endCursor }
                       nodes {
                         isArchived
+                        updatedAt
                         content {
                           __typename
-                          ... on Issue       { title url number state assignees(first: 5) { nodes { login } } }
-                          ... on PullRequest { title url number state assignees(first: 5) { nodes { login } } }
+                          ... on Issue       { title url number state closedAt assignees(first: 5) { nodes { login } } }
+                          ... on PullRequest { title url number state closedAt assignees(first: 5) { nodes { login } } }
                           ... on DraftIssue  { title assignees(first: 5) { nodes { login } } }
                         }
                         fieldValues(first: 30) {
@@ -66,7 +67,7 @@ jobs:
                             __typename
                             ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2FieldCommon { name } } }
                             ... on ProjectV2ItemFieldDateValue         { date field { ... on ProjectV2FieldCommon { name } } }
-                            ... on ProjectV2ItemFieldIterationValue    { title field { ... on ProjectV2FieldCommon { name } } }
+                            ... on ProjectV2ItemFieldIterationValue    { title startDate duration field { ... on ProjectV2FieldCommon { name } } }
                           }
                         }
                       }
@@ -89,80 +90,107 @@ jobs:
             // ---------- 2. Normalize ----------
             const today = new Date(); today.setUTCHours(0, 0, 0, 0);
             const horizon = new Date(today.getTime() + lookahead * DAY);
+            const weekAgo = new Date(Date.now() - 7 * DAY);
             const short = (s, n = 60) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
 
-            const items = raw.filter(i => !i.isArchived && i.content).map(i => {
+            // Items whose content GitHub hides (e.g. an issue in a private repo the token can't read)
+            const hidden = raw.filter(i => !i.isArchived && (!i.content || !i.content.title)).length;
+
+            const items = raw.filter(i => !i.isArchived && i.content && i.content.title).map(i => {
               const c = i.content;
-              let status = 'No Status', due = null;
+              let status = 'No Status', due = null, iteration = null;
               for (const fv of i.fieldValues.nodes) {
                 const fname = (fv.field && fv.field.name) || '';
                 if (fv.__typename === 'ProjectV2ItemFieldSingleSelectValue' && fname.toLowerCase() === statusField) status = fv.name;
                 if (fv.__typename === 'ProjectV2ItemFieldDateValue' && dueRe.test(fname) && !due) due = new Date(fv.date + 'T00:00:00Z');
+                if (fv.__typename === 'ProjectV2ItemFieldIterationValue' && !iteration) {
+                  const start = new Date(fv.startDate + 'T00:00:00Z');
+                  iteration = { title: fv.title, start, end: new Date(start.getTime() + fv.duration * DAY) };
+                }
               }
+              // "Current" = today falls inside the item's iteration window
+              const inCurrentIteration = !!iteration && iteration.start <= today && today < iteration.end;
               const assignees = ((c.assignees && c.assignees.nodes) || []).map(a => a.login);
               const done = /done|complete|closed|finished/i.test(status) || c.state === 'CLOSED' || c.state === 'MERGED';
+              const finishedAt = new Date(c.closedAt || i.updatedAt);
               const label = c.url ? `[#${c.number} ${short(c.title)}](${c.url})` : `${short(c.title)} *(draft)*`;
-              return { status, due, assignees, done, label };
+              return { status, due, assignees, done, finishedAt, label, iteration, inCurrentIteration };
             });
 
-            // ---------- 3. Bucket ----------
+            // ---------- 3. Bucket (each open item lands in exactly ONE section) ----------
             const open = items.filter(i => !i.done);
-            const byDue = (a, b) => a.due - b.due;
-            const overdue    = open.filter(i => i.due && i.due < today).sort(byDue);
-            const dueSoon    = open.filter(i => i.due && i.due >= today && i.due <= horizon).sort(byDue);
-            const blocked    = open.filter(i => /block|stuck|waiting/i.test(i.status));
-            const inProgress = open.filter(i => /progress|doing|review|testing/i.test(i.status));
-            const unassigned = open.filter(i => i.assignees.length === 0);
+            const byDue = (a, b) => (a.due || Infinity) - (b.due || Infinity);
+            const isActive = i => /progress|doing|review|testing|block|stuck|waiting/i.test(i.status);
+
+            // Closed = Done AND (in the current iteration, OR finished in the last 7 days, OR its end date was this week)
+            const closed = items.filter(i => i.done && (
+              i.inCurrentIteration ||
+              i.finishedAt >= weekAgo ||
+              (i.due && i.due >= weekAgo && i.due <= horizon)
+            ));
+            const currentIter = (items.find(i => i.inCurrentIteration) || {}).iteration;
+            const closedTitle = currentIter ? `✅ Closed this iteration — ${currentIter.title}` : '✅ Closed this week';
+            const overdue = [], inProgress = [], dueSoon = [], unassigned = [], upNext = [];
+            for (const i of open) {
+              if (i.due && i.due < today) overdue.push(i);
+              else if (isActive(i)) inProgress.push(i);
+              else if (i.due && i.due <= horizon) dueSoon.push(i);
+              else if (!i.assignees.length) unassigned.push(i);
+              else upNext.push(i);          // assigned, not started, nothing due this week
+            }
+            [overdue, inProgress, dueSoon, unassigned, upNext].forEach(a => a.sort(byDue));
 
             const counts = new Map();
             for (const i of items) counts.set(i.status, (counts.get(i.status) || 0) + 1);
-            const statusLine = [...counts].map(([s, n]) => `**${s}** ${n}`).join(' · ') || 'Board is empty';
-
             const doneCount = items.length - open.length;
             const pct = items.length ? Math.round((100 * doneCount) / items.length) : 0;
             const bar = '█'.repeat(Math.round(pct / 10)) + '░'.repeat(10 - Math.round(pct / 10));
 
-            // Issues closed in the last 7 days (for the "wins" section)
-            const weekAgo = new Date(Date.now() - 7 * DAY);
-            const closedIssues = await github.paginate(github.rest.issues.listForRepo, {
-              owner: context.repo.owner, repo: context.repo.repo,
-              state: 'closed', since: weekAgo.toISOString(), per_page: 100,
-            });
-            const wins = closedIssues
-              .filter(i => !i.pull_request && new Date(i.closed_at) >= weekAgo)
-              .map(i => ({ label: `[#${i.number} ${short(i.title)}](${i.html_url})`, assignees: (i.assignees || []).map(a => a.login), due: null }));
-
             // ---------- 4. Format ----------
             const md = d => d.toLocaleDateString('en-US', { timeZone: 'UTC', month: 'short', day: 'numeric' });
-            const fmt = (arr, { showOwner = true } = {}) => {
+            const fmt = (arr, { showOwner = true, showStatus = false } = {}) => {
               if (!arr.length) return '—';
               const lines = [];
               let len = 0;
               for (const [idx, x] of arr.entries()) {
                 let line = `• ${x.label}`;
+                if (showStatus && /block|stuck|waiting/i.test(x.status)) line = `• ⛔ ${x.label}`;
                 if (showOwner) line += x.assignees.length ? ` — ${x.assignees.join(', ')}` : ' — *unassigned*';
                 if (x.due) line += ` · ${md(x.due)}`;
                 const more = `…and ${arr.length - idx} more`;
-                if (len + line.length + more.length + 2 > 900) { lines.push(more); break; }
+                if (len + line.length + more.length + 2 > 1000) { lines.push(more); break; }
                 lines.push(line); len += line.length + 1;
               }
               return lines.join('\n');
             };
+            const divider = { name: '\u200b', value: '━━━━━━━━━━━━━━━━━━━━━━' };
 
-            const fields = [{ name: '📊 Board', value: `${statusLine}\n\`${bar}\` ${pct}% done (${doneCount}/${items.length})` }];
-            if (overdue.length) fields.push({ name: `🔴 Overdue (${overdue.length})`, value: fmt(overdue) });
-            fields.push({ name: `📅 Due in the next ${lookahead} days (${dueSoon.length})`, value: fmt(dueSoon) });
-            if (blocked.length) fields.push({ name: `⛔ Blocked (${blocked.length})`, value: fmt(blocked) });
-            fields.push({ name: `🔧 In progress (${inProgress.length})`, value: fmt(inProgress) });
-            fields.push({ name: `✅ Closed this week (${wins.length})`, value: fmt(wins) });
-            if (unassigned.length) fields.push({ name: `🙋 Unassigned open items (${unassigned.length})`, value: fmt(unassigned, { showOwner: false }) });
+            const fields = [
+              // — Wins —
+              { name: `${closedTitle} (${closed.length})`, value: fmt(closed) },
+              divider,
+              // — Active —
+              { name: `🔧 In progress (${inProgress.length})`, value: fmt(inProgress, { showStatus: true }) },
+              { name: `📅 Due in the next ${lookahead} days (${dueSoon.length})`, value: fmt(dueSoon) },
+            ];
+            if (upNext.length) fields.push({ name: `📌 Assigned, not started (${upNext.length})`, value: fmt(upNext) });
+            fields.push(
+              divider,
+              // — Needs attention —
+              { name: `🔴 Overdue (${overdue.length})`, value: fmt(overdue, { showStatus: true }) },
+              { name: `🙋 Unassigned open items (${unassigned.length})`, value: fmt(unassigned, { showOwner: false }) },
+            );
+
+            const statusLine = [...counts].map(([s, n]) => `${s} ${n}`).join(' · ') || 'Board is empty';
+            let footer = `${statusLine}  |  ${bar} ${pct}% done (${doneCount}/${items.length})  |  Week of ${md(today)}`;
+            if (hidden) footer += `  |  ⚠ ${hidden} item(s) hidden — token can't read them`;
 
             const embed = {
               title: `📋 ${project.title} — Weekly Digest`,
               url: project.url,
-              color: overdue.length || blocked.length ? 0xE5534B : 0x2EA043,
+              color: overdue.length ? 0xE5534B : 0x2EA043,
               fields,
-              footer: { text: `Week of ${md(today)}` },
+              footer: { text: footer },
               timestamp: new Date().toISOString(),
             };
 
