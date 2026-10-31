@@ -1,0 +1,176 @@
+# Weekly project-board digest → Discord
+# Place this file at: .github/workflows/project-digest.yml in senthecat/Cable-Cruisers
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   PROJECT_TOKEN        Classic personal access token with the `read:project` scope
+#                        (user-owned Projects can't be read by the default GITHUB_TOKEN)
+#   DISCORD_WEBHOOK_URL  Discord channel webhook URL — the plain URL, WITHOUT /github
+
+name: Weekly Project Digest
+
+on:
+  schedule:
+    # Mondays at 16:07 UTC = 8:07 AM Pacific standard time (9:07 AM after DST starts in March)
+    - cron: '7 16 * * 1'
+  workflow_dispatch: # lets you run it manually from the Actions tab
+
+permissions:
+  contents: read
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build and post digest
+        uses: actions/github-script@v8
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PROJECT_OWNER: senthecat
+          PROJECT_NUMBER: '2'
+          STATUS_FIELD: Status                         # name of the board's column field
+          DUE_FIELD_PATTERN: 'due|deadline|target|end' # date fields whose name matches count as due dates
+          LOOKAHEAD_DAYS: '7'
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN }}
+          script: |
+            const webhook = process.env.DISCORD_WEBHOOK_URL;
+            if (!webhook) { core.setFailed('DISCORD_WEBHOOK_URL secret is missing'); return; }
+            if (webhook.endsWith('/github')) { core.setFailed('Use the plain Discord webhook URL here, without /github'); return; }
+
+            const login = process.env.PROJECT_OWNER;
+            const number = parseInt(process.env.PROJECT_NUMBER, 10);
+            const statusField = process.env.STATUS_FIELD.toLowerCase();
+            const dueRe = new RegExp(process.env.DUE_FIELD_PATTERN, 'i');
+            const lookahead = parseInt(process.env.LOOKAHEAD_DAYS, 10);
+            const DAY = 86400000;
+
+            // ---------- 1. Pull every item on the board ----------
+            const query = `
+              query($login: String!, $number: Int!, $cursor: String) {
+                user(login: $login) {
+                  projectV2(number: $number) {
+                    title
+                    url
+                    items(first: 100, after: $cursor) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes {
+                        isArchived
+                        content {
+                          __typename
+                          ... on Issue       { title url number state assignees(first: 5) { nodes { login } } }
+                          ... on PullRequest { title url number state assignees(first: 5) { nodes { login } } }
+                          ... on DraftIssue  { title assignees(first: 5) { nodes { login } } }
+                        }
+                        fieldValues(first: 30) {
+                          nodes {
+                            __typename
+                            ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2FieldCommon { name } } }
+                            ... on ProjectV2ItemFieldDateValue         { date field { ... on ProjectV2FieldCommon { name } } }
+                            ... on ProjectV2ItemFieldIterationValue    { title field { ... on ProjectV2FieldCommon { name } } }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }`;
+
+            let project, cursor = null;
+            const raw = [];
+            do {
+              const res = await github.graphql(query, { login, number, cursor });
+              project = res.user && res.user.projectV2;
+              if (!project) { core.setFailed(`Project #${number} not found for ${login} — check PROJECT_TOKEN has read:project`); return; }
+              raw.push(...project.items.nodes);
+              const pi = project.items.pageInfo;
+              cursor = pi.hasNextPage ? pi.endCursor : null;
+            } while (cursor);
+
+            // ---------- 2. Normalize ----------
+            const today = new Date(); today.setUTCHours(0, 0, 0, 0);
+            const horizon = new Date(today.getTime() + lookahead * DAY);
+            const short = (s, n = 60) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
+
+            const items = raw.filter(i => !i.isArchived && i.content).map(i => {
+              const c = i.content;
+              let status = 'No Status', due = null;
+              for (const fv of i.fieldValues.nodes) {
+                const fname = (fv.field && fv.field.name) || '';
+                if (fv.__typename === 'ProjectV2ItemFieldSingleSelectValue' && fname.toLowerCase() === statusField) status = fv.name;
+                if (fv.__typename === 'ProjectV2ItemFieldDateValue' && dueRe.test(fname) && !due) due = new Date(fv.date + 'T00:00:00Z');
+              }
+              const assignees = ((c.assignees && c.assignees.nodes) || []).map(a => a.login);
+              const done = /done|complete|closed|finished/i.test(status) || c.state === 'CLOSED' || c.state === 'MERGED';
+              const label = c.url ? `[#${c.number} ${short(c.title)}](${c.url})` : `${short(c.title)} *(draft)*`;
+              return { status, due, assignees, done, label };
+            });
+
+            // ---------- 3. Bucket ----------
+            const open = items.filter(i => !i.done);
+            const byDue = (a, b) => a.due - b.due;
+            const overdue    = open.filter(i => i.due && i.due < today).sort(byDue);
+            const dueSoon    = open.filter(i => i.due && i.due >= today && i.due <= horizon).sort(byDue);
+            const blocked    = open.filter(i => /block|stuck|waiting/i.test(i.status));
+            const inProgress = open.filter(i => /progress|doing|review|testing/i.test(i.status));
+            const unassigned = open.filter(i => i.assignees.length === 0);
+
+            const counts = new Map();
+            for (const i of items) counts.set(i.status, (counts.get(i.status) || 0) + 1);
+            const statusLine = [...counts].map(([s, n]) => `**${s}** ${n}`).join(' · ') || 'Board is empty';
+
+            const doneCount = items.length - open.length;
+            const pct = items.length ? Math.round((100 * doneCount) / items.length) : 0;
+            const bar = '█'.repeat(Math.round(pct / 10)) + '░'.repeat(10 - Math.round(pct / 10));
+
+            // Issues closed in the last 7 days (for the "wins" section)
+            const weekAgo = new Date(Date.now() - 7 * DAY);
+            const closedIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'closed', since: weekAgo.toISOString(), per_page: 100,
+            });
+            const wins = closedIssues
+              .filter(i => !i.pull_request && new Date(i.closed_at) >= weekAgo)
+              .map(i => ({ label: `[#${i.number} ${short(i.title)}](${i.html_url})`, assignees: (i.assignees || []).map(a => a.login), due: null }));
+
+            // ---------- 4. Format ----------
+            const md = d => d.toLocaleDateString('en-US', { timeZone: 'UTC', month: 'short', day: 'numeric' });
+            const fmt = (arr, { showOwner = true } = {}) => {
+              if (!arr.length) return '—';
+              const lines = [];
+              let len = 0;
+              for (const [idx, x] of arr.entries()) {
+                let line = `• ${x.label}`;
+                if (showOwner) line += x.assignees.length ? ` — ${x.assignees.join(', ')}` : ' — *unassigned*';
+                if (x.due) line += ` · ${md(x.due)}`;
+                const more = `…and ${arr.length - idx} more`;
+                if (len + line.length + more.length + 2 > 900) { lines.push(more); break; }
+                lines.push(line); len += line.length + 1;
+              }
+              return lines.join('\n');
+            };
+
+            const fields = [{ name: '📊 Board', value: `${statusLine}\n\`${bar}\` ${pct}% done (${doneCount}/${items.length})` }];
+            if (overdue.length) fields.push({ name: `🔴 Overdue (${overdue.length})`, value: fmt(overdue) });
+            fields.push({ name: `📅 Due in the next ${lookahead} days (${dueSoon.length})`, value: fmt(dueSoon) });
+            if (blocked.length) fields.push({ name: `⛔ Blocked (${blocked.length})`, value: fmt(blocked) });
+            fields.push({ name: `🔧 In progress (${inProgress.length})`, value: fmt(inProgress) });
+            fields.push({ name: `✅ Closed this week (${wins.length})`, value: fmt(wins) });
+            if (unassigned.length) fields.push({ name: `🙋 Unassigned open items (${unassigned.length})`, value: fmt(unassigned, { showOwner: false }) });
+
+            const embed = {
+              title: `📋 ${project.title} — Weekly Digest`,
+              url: project.url,
+              color: overdue.length || blocked.length ? 0xE5534B : 0x2EA043,
+              fields,
+              footer: { text: `Week of ${md(today)}` },
+              timestamp: new Date().toISOString(),
+            };
+
+            // ---------- 5. Send ----------
+            const resp = await fetch(webhook, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ username: 'Cable Cruisers Bot', embeds: [embed], allowed_mentions: { parse: [] } }),
+            });
+            if (!resp.ok) core.setFailed(`Discord returned ${resp.status}: ${await resp.text()}`);
+            else core.info(`Posted digest: ${items.length} items, ${overdue.length} overdue, ${dueSoon.length} due soon.`);
