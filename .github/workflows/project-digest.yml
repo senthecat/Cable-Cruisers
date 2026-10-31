@@ -10,8 +10,9 @@ name: Weekly Project Digest
 
 on:
   schedule:
-  - cron: '7 2 * * 1'   # Sunday 6:07 PM Pacific: full digest
-  - cron: '7 1 * * 4'   # Wednesday 5:07 PM Pacific: quick check
+    # GitHub cron is UTC. Pacific Standard Time = UTC-8 (in effect Nov 1 – Mar 13).
+    - cron: '7 2 * * 1'   # Sunday 6:07 PM Pacific     → full weekly digest
+    - cron: '7 1 * * 4'   # Wednesday 5:07 PM Pacific  → midweek check (unassigned / overdue / blocked)
   workflow_dispatch: # lets you run it manually from the Actions tab
 
 permissions:
@@ -36,6 +37,18 @@ jobs:
             const webhook = process.env.DISCORD_WEBHOOK_URL;
             if (!webhook) { core.setFailed('DISCORD_WEBHOOK_URL secret is missing'); return; }
             if (webhook.endsWith('/github')) { core.setFailed('Use the plain Discord webhook URL here, without /github'); return; }
+
+            // Pause scheduled posts during finals and breaks (manual "Run workflow" still posts)
+            const blackouts = [
+              ['2026-12-05', '2027-01-02'],   // fall finals + winter break
+              ['2027-03-13', '2027-03-28'],   // winter finals + spring break
+            ];
+            const todayPT = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+            if (context.eventName === 'schedule' && blackouts.some(([a, b]) => todayPT >= a && todayPT <= b)) {
+              core.info(`Blackout period (${todayPT}), skipping`); return;
+            }
+            const MIDWEEK_CRON = '7 1 * * 4';   // must match the Wednesday cron line exactly
+            const isMidweek = context.payload.schedule === MIDWEEK_CRON;
 
             const login = process.env.PROJECT_OWNER;
             const number = parseInt(process.env.PROJECT_NUMBER, 10);
@@ -132,10 +145,10 @@ jobs:
             const closedTitle = currentIter ? `✅ Closed this iteration — ${currentIter.title}` : '✅ Closed this week';
             const overdue = [], inProgress = [], dueSoon = [], unassigned = [], upNext = [];
             for (const i of open) {
-              if (i.due && i.due < today) overdue.push(i);
+              if (!i.assignees.length) unassigned.push(i);            // no owner wins over everything else
+              else if (i.due && i.due < today) overdue.push(i);
               else if (isActive(i)) inProgress.push(i);
               else if (i.due && i.due <= horizon) dueSoon.push(i);
-              else if (!i.assignees.length) unassigned.push(i);
               else upNext.push(i);          // assigned, not started, nothing due this week
             }
             [overdue, inProgress, dueSoon, unassigned, upNext].forEach(a => a.sort(byDue));
@@ -156,7 +169,7 @@ jobs:
                 let line = `• ${x.label}`;
                 if (showStatus && /block|stuck|waiting/i.test(x.status)) line = `• ⛔ ${x.label}`;
                 if (showOwner) line += x.assignees.length ? ` — ${x.assignees.join(', ')}` : ' — *unassigned*';
-                if (x.due) line += ` · ${md(x.due)}`;
+                if (x.due) line += (!x.done && x.due < today) ? ` · 🔴 overdue ${md(x.due)}` : ` · ${md(x.due)}`;
                 const more = `…and ${arr.length - idx} more`;
                 if (len + line.length + more.length + 2 > 1000) { lines.push(more); break; }
                 lines.push(line); len += line.length + 1;
@@ -177,16 +190,25 @@ jobs:
             fields.push(
               divider,
               // — Needs attention —
-              { name: `🔴 Overdue (${overdue.length})`, value: fmt(overdue, { showStatus: true }) },
               { name: `🙋 Unassigned open items (${unassigned.length})`, value: fmt(unassigned, { showOwner: false }) },
+              { name: `🔴 Overdue (${overdue.length})`, value: fmt(overdue, { showStatus: true }) },
             );
+
+            if (isMidweek) {
+              const blocked = inProgress.filter(i => /block|stuck|waiting/i.test(i.status));
+              fields.length = 0;
+              if (unassigned.length) fields.push({ name: `🙋 Unassigned open items (${unassigned.length})`, value: fmt(unassigned, { showOwner: false }) });
+              if (overdue.length) fields.push({ name: `🔴 Overdue (${overdue.length})`, value: fmt(overdue, { showStatus: true }) });
+              if (blocked.length) fields.push({ name: `⛔ Blocked (${blocked.length})`, value: fmt(blocked) });
+              if (!fields.length) fields.push({ name: '✅ All clear', value: 'Nothing unassigned, overdue, or blocked.' });
+            }
 
             const statusLine = [...counts].map(([s, n]) => `${s} ${n}`).join(' · ') || 'Board is empty';
             let footer = `${statusLine}  |  ${bar} ${pct}% done (${doneCount}/${items.length})  |  Week of ${md(today)}`;
             if (hidden) footer += `  |  ⚠ ${hidden} item(s) hidden — token can't read them`;
 
             const embed = {
-              title: `📋 ${project.title} — Weekly Digest`,
+              title: `📋 ${project.title} — ${isMidweek ? 'Midweek Check' : 'Weekly Digest'}`,
               url: project.url,
               color: overdue.length ? 0xE5534B : 0x2EA043,
               fields,
