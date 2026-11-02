@@ -15,6 +15,7 @@
 name: Weekly Project Digest
 
 on:
+<<<<<<< HEAD
   workflow_dispatch: # started by cron-job.org on schedule, or manually from the Actions tab
     inputs:
       mode:
@@ -26,6 +27,13 @@ on:
         description: 'Set by the external timer so finals/break pauses apply (leave unchecked for manual runs)'
         type: boolean
         default: false
+=======
+  schedule:
+    # GitHub cron is UTC. Pacific Standard Time = UTC-8 (in effect Nov 1 – Mar 13).
+    - cron: '7 2 * * 1'   # Sunday 6:07 PM Pacific     → full weekly digest
+    - cron: '7 1 * * 4'   # Wednesday 5:07 PM Pacific  → midweek check (unassigned / overdue / blocked)
+  workflow_dispatch: # lets you run it manually from the Actions tab
+>>>>>>> 80228b06cdf7175948704234ce4981e0d7bcd49e
 
 permissions:
   contents: read
@@ -56,12 +64,20 @@ jobs:
               ['2027-03-13', '2027-03-28'],   // winter finals + spring break
             ];
             const todayPT = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+<<<<<<< HEAD
             const inputs = context.payload.inputs || {};
             const automated = context.eventName === 'schedule' || String(inputs.automated) === 'true';
             if (automated && blackouts.some(([a, b]) => todayPT >= a && todayPT <= b)) {
               core.info(`Blackout period (${todayPT}), skipping`); return;
             }
             const isMidweek = inputs.mode === 'midweek';
+=======
+            if (context.eventName === 'schedule' && blackouts.some(([a, b]) => todayPT >= a && todayPT <= b)) {
+              core.info(`Blackout period (${todayPT}), skipping`); return;
+            }
+            const MIDWEEK_CRON = '7 1 * * 4';   // must match the Wednesday cron line exactly
+            const isMidweek = context.payload.schedule === MIDWEEK_CRON;
+>>>>>>> 80228b06cdf7175948704234ce4981e0d7bcd49e
 
             const login = process.env.PROJECT_OWNER;
             const number = parseInt(process.env.PROJECT_NUMBER, 10);
