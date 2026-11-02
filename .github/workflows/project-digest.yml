@@ -139,7 +139,7 @@ jobs:
               const assignees = ((c.assignees && c.assignees.nodes) || []).map(a => a.login);
               const done = /done|complete|closed|finished/i.test(status) || c.state === 'CLOSED' || c.state === 'MERGED';
               const finishedAt = new Date(c.closedAt || i.updatedAt);
-              const label = c.url ? `[#${c.number} ${short(c.title)}](${c.url})` : `${short(c.title)} *(draft)*`;
+              const label = c.url ? `[${short(c.title)}](${c.url})` : `${short(c.title)} *(draft)*`;
               return { status, due, assignees, done, finishedAt, label, iteration, inCurrentIteration };
             });
 

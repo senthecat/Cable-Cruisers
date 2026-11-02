@@ -135,7 +135,7 @@ jobs:
             }
 
             const short = (s, n = 70) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
-            const label = x => (x.url ? `[#${x.number} ${short(x.title)}](${x.url})` : `**${short(x.title)}** *(draft)*`);
+            const label = x => (x.url ? `[${short(x.title)}](${x.url})` : `**${short(x.title)}** *(draft)*`);
             const isDone = x => /done|complete|closed|finished/i.test(x.status) || x.state === 'CLOSED' || x.state === 'MERGED';
             const who = x => (x.assignees.length ? ` (${x.assignees.join(', ')})` : '');
 
