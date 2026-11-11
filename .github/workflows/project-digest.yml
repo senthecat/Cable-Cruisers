@@ -1,4 +1,4 @@
-# Weekly project-board digest → Discord
+# Daily project-board digest → Discord
 # Place this file at: .github/workflows/project-digest.yml in senthecat/Cable-Cruisers
 #
 # Required repository secrets (Settings → Secrets and variables → Actions):
@@ -9,16 +9,16 @@
 # Timing: GitHub's own `schedule:` trigger is best-effort and often runs late or not at all,
 # so this workflow is started by an external timer (cron-job.org) calling the GitHub API:
 #   POST https://api.github.com/repos/senthecat/Cable-Cruisers/actions/workflows/project-digest.yml/dispatches
-#   Sunday 6:00 PM Pacific    body: {"ref":"main","inputs":{"mode":"full","automated":"true"}}
+#   Daily 6:00 PM Pacific     body: {"ref":"main","inputs":{"mode":"full","automated":"true"}}
 #   Wednesday 5:00 PM Pacific body: {"ref":"main","inputs":{"mode":"midweek","automated":"true"}}
 
-name: Weekly Project Digest
+name: Daily Project Digest
 
 on:
   workflow_dispatch: # started by cron-job.org on schedule, or manually from the Actions tab
     inputs:
       mode:
-        description: 'full = weekly digest, midweek = unassigned / overdue / blocked only'
+        description: 'full = daily digest, midweek = unassigned / overdue / blocked only'
         type: choice
         options: [full, midweek]
         default: full
@@ -114,7 +114,9 @@ jobs:
             } while (cursor);
 
             // ---------- 2. Normalize ----------
-            const today = new Date(); today.setUTCHours(0, 0, 0, 0);
+            // Pacific calendar date at UTC midnight, matching how due dates are parsed below
+            // (a 6 PM PT run is already tomorrow in UTC)
+            const today = new Date(todayPT + 'T00:00:00Z');
             const horizon = new Date(today.getTime() + lookahead * DAY);
             const weekAgo = new Date(Date.now() - 7 * DAY);
             const short = (s, n = 60) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
@@ -155,7 +157,7 @@ jobs:
               (i.due && i.due >= weekAgo && i.due <= horizon)
             ));
             const currentIter = (items.find(i => i.inCurrentIteration) || {}).iteration;
-            const closedTitle = currentIter ? `✅ Closed this iteration — ${currentIter.title}` : '✅ Closed this week';
+            const closedTitle = currentIter ? `✅ Closed this iteration — ${currentIter.title}` : '✅ Closed in the last 7 days';
             const overdue = [], inProgress = [], dueSoon = [], unassigned = [], upNext = [];
             for (const i of open) {
               if (!i.assignees.length) unassigned.push(i);            // no owner wins over everything else
@@ -217,11 +219,11 @@ jobs:
             }
 
             const statusLine = [...counts].map(([s, n]) => `${s} ${n}`).join(' · ') || 'Board is empty';
-            let footer = `${statusLine}  |  ${bar} ${pct}% done (${doneCount}/${items.length})  |  Week of ${md(today)}`;
+            let footer = `${statusLine}  |  ${bar} ${pct}% done (${doneCount}/${items.length})  |  ${today.toLocaleDateString('en-US', { timeZone: 'UTC', weekday: 'short', month: 'short', day: 'numeric' })}`;
             if (hidden) footer += `  |  ⚠ ${hidden} item(s) hidden — token can't read them`;
 
             const embed = {
-              title: `📋 ${project.title} — ${isMidweek ? 'Midweek Check' : 'Weekly Digest'}`,
+              title: `📋 ${project.title} — ${isMidweek ? 'Midweek Check' : 'Daily Digest'}`,
               url: project.url,
               color: overdue.length ? 0xE5534B : 0x2EA043,
               fields,
